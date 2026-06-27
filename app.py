@@ -7,6 +7,8 @@ import re
 import json
 import sqlite3
 from datetime import datetime, timezone
+import math
+
 
 load_dotenv()
 
@@ -28,6 +30,7 @@ def init_db():
                 status      TEXT,
                 llm_score     REAL,
                 llm_rationale TEXT,
+                stylometric_score   REAL,
                 text_excerpt  TEXT
 
             )
@@ -88,14 +91,74 @@ def llm_classify(text: str) -> dict:
     except Exception as e:
         return {"score": 0.5, "rationale": f"Error during classification: {str(e)}"}
 
-def placeholder_confidence(llm_score: float) -> dict:
-    if llm_score >= 0.72:
+def stylometric_classify(text: str) -> float:
+    """
+    Computes three structural metrics and combines them into a single
+    AI-probability score (1.0 = very likely AI-generated).
+ 
+    Metrics:
+      1. Sentence length variance  — low variance → AI
+      2. Type-token ratio (TTR)    — low vocabulary diversity → AI
+      3. Expressive punctuation    — low density → AI
+    """
+    sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
+    if len(sentences) < 2:
+        # Too short for reliable structural analysis — return neutral
+        return 0.5
+ 
+    # ── Metric 1: Sentence length variance ──
+    word_counts = [len(s.split()) for s in sentences]
+    mean_wc = sum(word_counts) / len(word_counts)
+    variance = sum((x - mean_wc) ** 2 for x in word_counts) / len(word_counts)
+    std_dev = math.sqrt(variance)
+    # std_dev > 15 → very human; std_dev < 2 → very AI
+    # Map [0, 15] → [1.0, 0.0]
+    variance_score = max(0.0, min(1.0, 1.0 - (std_dev / 15.0)))
+ 
+    # ── Metric 2: Type-token ratio ──
+    words = re.findall(r"\b[a-zA-Z]+\b", text.lower())
+    if not words:
+        ttr_score = 0.5
+    else:
+        ttr = len(set(words)) / len(words)
+        # TTR < 0.4 → AI-like; TTR > 0.8 → human-like
+        # Map [0.4, 0.8] → [1.0, 0.0]
+        ttr_score = max(0.0, min(1.0, 1.0 - (ttr - 0.4) / 0.4))
+ 
+    # ── Metric 3: Expressive punctuation density ──
+    expressive_punct = len(re.findall(r"[—–…!?;()\[\]]", text))
+    punct_density = expressive_punct / max(1, len(words))
+    # > 0.08 → human-like; < 0.01 → AI-like
+    # Map [0, 0.08] → [1.0, 0.0]
+    punct_score = max(0.0, min(1.0, 1.0 - (punct_density / 0.08)))
+ 
+    return round(0.4 * variance_score + 0.4 * ttr_score + 0.2 * punct_score, 4)
+ 
+ 
+# ── Confidence Scoring ────────────────────────────────────────────────────────
+ 
+def compute_confidence(llm_score: float, stylometric_score: float) -> dict:
+    """
+    Combines both signals into a final confidence score and attribution verdict.
+ 
+    Weighting: LLM 60%, stylometric 40%
+    Thresholds (asymmetric — favours false-negative over false-positive):
+      >= 0.70  → likely_ai
+      0.40–0.69 → uncertain
+      < 0.40   → likely_human
+    """
+    confidence = round(0.6 * llm_score + 0.4 * stylometric_score, 4)
+ 
+    if confidence >= 0.70:
         attribution = "likely_ai"
-    elif llm_score >= 0.40:
+    elif confidence >= 0.40:
         attribution = "uncertain"
     else:
         attribution = "likely_human"
-    return {"confidence": llm_score, "attribution": attribution}
+ 
+    return {"confidence": confidence, "attribution": attribution}
+
+
 def placeholder_label(attribution: str, confidence: float) -> str:
     pct = round(confidence * 100)
     return {
@@ -123,7 +186,8 @@ def submit():
 
 
     llm_result = llm_classify(text)
-    scoring = placeholder_confidence(llm_result["score"])
+    stylo_score= stylometric_classify(text)
+    scoring = compute_confidence(llm_result["score"], stylo_score)
     label = placeholder_label(scoring["attribution"], scoring["confidence"])
     content_id = str(uuid.uuid4())
 
@@ -135,6 +199,7 @@ def submit():
         "status": "classified",
         "llm_score": llm_result["score"],
         "llm_rationale": llm_result["rationale"],
+        "stylometric_score": stylo_score,
         "text_excerpt": text[:200]
     })
     return jsonify({
@@ -144,6 +209,7 @@ def submit():
         "label": label,
         "llm_score": llm_result["score"],
         "llm_rationale": llm_result["rationale"],
+        "stylometric_score": stylo_score,
         "text_excerpt": text[:200]
     }), 200
  
