@@ -1,4 +1,6 @@
 from flask import Flask, request, jsonify
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import uuid
 from groq import Groq
 from dotenv import load_dotenv
@@ -13,6 +15,15 @@ import math
 load_dotenv()
 
 app = Flask(__name__)
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://",
+)
+
+
 @app.route('/')
 def home():
     return "Provenance Guard is running!"
@@ -31,7 +42,9 @@ def init_db():
                 llm_score     REAL,
                 llm_rationale TEXT,
                 stylometric_score   REAL,
-                text_excerpt  TEXT
+                text_excerpt  TEXT,
+                appeal_timestamp    TEXT,
+                appeal_reasoning    TEXT
 
             )
         """)
@@ -40,8 +53,13 @@ def log_event(entry):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT INTO audit_log VALUES (:content_id, :creator_id, :timestamp, "
-            ":attribution, :confidence, :status, :llm_score, :llm_rationale, :text_excerpt)",
-            {**entry, "timestamp": datetime.now(timezone.utc).isoformat()},
+            ":attribution, :confidence, :status, :llm_score, :llm_rationale, :stylometric_score, :text_excerpt, :appeal_timestamp, :appeal_reasoning)",
+            {
+                "appeal_timestamp": None,
+                "appeal_reasoning": None,
+                **entry,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+                },
         )
 
 
@@ -54,6 +72,25 @@ def read_log(limit=20):
             "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?", (limit,)
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_record(content_id: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM audit_log WHERE content_id = ?", (content_id,)
+        ).fetchone()
+    return dict(row) if row else None
+ 
+def update_appeal(content_id: str, reasoning: str, timestamp: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE audit_log SET status = 'under_review', "
+            "appeal_timestamp = ?, appeal_reasoning = ? "
+            "WHERE content_id = ?",
+            (timestamp, reasoning, content_id),
+        )
+
 
 
 #groq classifier
@@ -159,18 +196,44 @@ def compute_confidence(llm_score: float, stylometric_score: float) -> dict:
     return {"confidence": confidence, "attribution": attribution}
 
 
-def placeholder_label(attribution: str, confidence: float) -> str:
+def generate_label(attribution: str, confidence: float) -> str:
+    """
+    Maps verdict + confidence to the full user-facing transparency label.
+ 
+    Variants:
+      likely_ai    — cautions without accusing; surfaces appeal path
+      uncertain    — honest about inability to determine; surfaces appeal path
+      likely_human — affirming but not overclaiming
+    """
     pct = round(confidence * 100)
-    return {
-        "likely_ai":    f"Likely AI-generated (confidence: {pct}%)",
-        "uncertain":    f"Authorship uncertain (confidence: {pct}%)",
-        "likely_human": f"Likely human-written (confidence: {pct}%)",
-    }[attribution]
+    human_pct = round((1 - confidence) * 100)
+ 
+    if attribution == "likely_ai":
+        return (
+            f"Likely AI-generated\n"
+            f"Our analysis found strong indicators that this content may have been created "
+            f"with AI assistance. Confidence: {pct}%. The author can contest this "
+            f"classification if they believe it's incorrect."
+        )
+    elif attribution == "uncertain":
+        return (
+            f"Authorship uncertain\n"
+            f"Our tools couldn't confidently determine whether this content was written by "
+            f"a person or with AI assistance. Confidence in AI authorship: {pct}%. The "
+            f"author can provide more context if they'd like."
+        )
+    else:
+        return (
+            f"Likely human-written\n"
+            f"Our analysis found no significant indicators of AI generation in this content. "
+            f"Confidence in human authorship: {human_pct}%."
+        )
 
 
 
 
 @app.route("/submit", methods=["POST"])
+@limiter.limit("10 per minute;50 per day")
 def submit():
     data=request.get_json(silent=True)
     if not data:
@@ -188,7 +251,7 @@ def submit():
     llm_result = llm_classify(text)
     stylo_score= stylometric_classify(text)
     scoring = compute_confidence(llm_result["score"], stylo_score)
-    label = placeholder_label(scoring["attribution"], scoring["confidence"])
+    label = generate_label(scoring["attribution"], scoring["confidence"])
     content_id = str(uuid.uuid4())
 
     log_event({
@@ -213,9 +276,74 @@ def submit():
         "text_excerpt": text[:200]
     }), 200
  
+@app.route("/appeal", methods=["POST"])
+def appeal():
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Invalid JSON data"}), 400
+ 
+    content_id = data.get("content_id", "").strip()
+    reasoning = data.get("creator_reasoning", "").strip()
+ 
+    if not content_id:
+        return jsonify({"error": "Missing 'content_id' field"}), 400
+    if not reasoning or len(reasoning) < 10:
+        return jsonify({"error": "Missing or too-short 'creator_reasoning' field (minimum 10 characters)"}), 400
+ 
+    record = get_record(content_id)
+    if not record:
+        return jsonify({"error": f"No submission found with content_id: {content_id}"}), 404
+ 
+    if record["status"] == "under_review":
+        return jsonify({
+            "content_id": content_id,
+            "status":     "under_review",
+            "message":    "This submission is already under review. A human reviewer will assess it.",
+        }), 200
+ 
+    appeal_timestamp = datetime.now(timezone.utc).isoformat()
+    update_appeal(content_id, reasoning, appeal_timestamp)
+ 
+    return jsonify({
+        "content_id":         content_id,
+        "status":             "under_review",
+        "appeal_timestamp":   appeal_timestamp,
+        "original_attribution": record["attribution"],
+        "original_confidence":  record["confidence"],
+        "message": (
+            "Your appeal has been received and logged. A human reviewer will assess "
+            "your submission and its original classification. This decision will be "
+            "made by a person, not an automated re-classification."
+        ),
+    }), 200
+
+
+
+
 @app.route("/log", methods=["GET"])
 def view_log():
     return jsonify({"entries": read_log()}), 200
+
+@app.route("/appeals", methods=["GET"])
+def view_appeals():
+    """Returns all submissions currently under review — the human reviewer queue."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM audit_log WHERE status = 'under_review' "
+            "ORDER BY appeal_timestamp DESC"
+        ).fetchall()
+    return jsonify({"count": len(rows), "appeals": [dict(r) for r in rows]}), 200
+ 
+ 
+@app.errorhandler(429)
+def rate_limit_exceeded(e):
+    return jsonify({
+        "error":   "Rate limit exceeded",
+        "message": "Too many submissions. Please wait before trying again.",
+    }), 429
+
+
 
 #this has to be the last thing
 if __name__ == '__main__':
